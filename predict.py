@@ -35,7 +35,7 @@ OUTPUT_PATH = Path("submission.csv")
 SAMPLE_SUBMISSION_PATH = Path("sample_submission.csv")
 NUM_CLASSES = 2
 CLASS_NAMES = ["chihuahua", "muffin"]
-BATCH_SIZE = 32  # Reduce if your system runs out of memory
+BATCH_SIZE = 32
 IMAGE_SIZE = 128
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -43,23 +43,28 @@ print(f"Using device: {device}")
 
 
 # ============================================================================
-# MODEL (must match train.py)
+# MODEL — must be an exact copy of ResNet18Classifier in train.py
 # ============================================================================
 
 class ResNet18Classifier(nn.Module):
     def __init__(self, num_classes=2):
-        super(ResNet18Classifier, self).__init__()
+        super().__init__()
+        # weights=None because we load our own trained weights below
         self.resnet = models.resnet18(weights=None)
-        resnet_features = self.resnet.fc.in_features
+        features = self.resnet.fc.in_features
         self.resnet.fc = nn.Identity()
+
+        # Matches train.py exactly: 512 → 256 → num_classes, Dropout 0.4
         self.classifier = nn.Sequential(
-            nn.Linear(resnet_features, 256),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(128, num_classes),
+            nn.Linear(features, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.4),
+            nn.Linear(512, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.4),
+            nn.Linear(256, num_classes),
         )
 
     def forward(self, x):
@@ -71,7 +76,7 @@ class ResNet18Classifier(nn.Module):
 # ============================================================================
 
 class TestDataset(Dataset):
-    """Flat test folder: all images, no labels. Returns (image, image_id)."""
+    """Flat test folder: all images, no labels. Returns (image_tensor, image_id)."""
     def __init__(self, image_dir: Path, transform=None):
         self.image_dir = Path(image_dir)
         self.transform = transform
@@ -100,21 +105,24 @@ class TestDataset(Dataset):
         if self.transform:
             image = self.transform(image)
         # Use stem (no extension) as image_id to match typical Kaggle format
-        image_id = img_path.stem
-        return image, image_id
+        return image, img_path.stem
 
 
 # ============================================================================
-# TRANSFORMS
+# TRANSFORMS — must match val_transform in train.py exactly
 # ============================================================================
 
 test_transform = transforms.Compose([
-    transforms.Resize(IMAGE_SIZE),
+    transforms.Resize(128),           # matches val_transform: Resize(128)
     transforms.CenterCrop(IMAGE_SIZE),
     transforms.ToTensor(),
     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
 ])
 
+
+# ============================================================================
+# INFERENCE
+# ============================================================================
 
 def predict_on_dataset(model, dataloader, device):
     predictions = []
@@ -125,7 +133,11 @@ def predict_on_dataset(model, dataloader, device):
             outputs = model(images)
             probs = torch.nn.functional.softmax(outputs, dim=1)
             confidences, predicted = probs.max(1)
-            for fid, pred, conf in zip(filenames, predicted.cpu().numpy(), confidences.cpu().numpy()):
+            for fid, pred, conf in zip(
+                filenames,
+                predicted.cpu().numpy(),
+                confidences.cpu().numpy()
+            ):
                 predictions.append({
                     "image_id": fid,
                     "prediction": int(pred),
@@ -145,13 +157,18 @@ def load_expected_image_ids():
         return [row["image_id"] for row in reader]
 
 
+# ============================================================================
+# MAIN
+# ============================================================================
+
 def main():
     print("=" * 60)
     print("  Chihuahua vs Muffin - Prediction")
     print("=" * 60)
 
+    # ── 1. Load model ────────────────────────────────────────────────────────
     if not MODEL_PATH.exists():
-        print(f"[ERROR] Model not found: {MODEL_PATH}")
+        print(f"\n[ERROR] Model not found: {MODEL_PATH}")
         print("  Run train.py first to train and save best_model.pth.")
         return 1
 
@@ -161,44 +178,54 @@ def main():
     except Exception as e:
         print(f"[ERROR] Could not load model file: {e}")
         return 1
+
     model = ResNet18Classifier(num_classes=NUM_CLASSES)
     try:
         model.load_state_dict(state)
-    except Exception as e:
-        print(f"[ERROR] Model state_dict invalid or incompatible: {e}")
+    except RuntimeError as e:
+        print(f"[ERROR] Model state_dict incompatible with architecture: {e}")
+        print("  Make sure ResNet18Classifier here matches train.py exactly.")
         return 1
+
     model = model.to(device)
     model.eval()
     print(f"  [OK] Loaded {MODEL_PATH}")
 
+    # ── 2. Run inference ─────────────────────────────────────────────────────
     print("\n[2/4] Predicting on test images...")
     if not TEST_DIR.exists():
         print(f"  [ERROR] Test directory not found: {TEST_DIR}")
         return 1
+
     test_dataset = TestDataset(TEST_DIR, transform=test_transform)
     if len(test_dataset) == 0:
-        print(f"  [ERROR] No images in {TEST_DIR}. Add test images (flat folder).")
+        print(f"  [ERROR] No images found in {TEST_DIR}.")
         return 1
-    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+
+    test_loader = DataLoader(
+        test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0
+    )
     predictions = predict_on_dataset(model, test_loader, device)
     pred_by_id = {p["image_id"]: p for p in predictions}
     print(f"  [OK] Predicted {len(predictions)} images")
 
+    # ── 3. Align to sample_submission order ──────────────────────────────────
     print("\n[3/4] Aligning to submission format...")
     expected_ids = load_expected_image_ids()
     if expected_ids is not None:
-        # Ensure submission has same rows and order as sample_submission.csv
         rows = []
         for image_id in expected_ids:
             if image_id in pred_by_id:
                 rows.append(pred_by_id[image_id])
             else:
+                # Image listed in sample but not found in test folder
                 rows.append({"image_id": image_id, "prediction": 0, "confidence": 0.5})
         predictions = rows
         print(f"  [OK] Aligned to {SAMPLE_SUBMISSION_PATH} ({len(predictions)} rows)")
     else:
-        print(f"  [INFO] No {SAMPLE_SUBMISSION_PATH}; output order = test folder order")
+        print(f"  [INFO] No {SAMPLE_SUBMISSION_PATH} found; order = test folder order")
 
+    # ── 4. Write CSV ──────────────────────────────────────────────────────────
     print("\n[4/4] Writing submission.csv...")
     with open(OUTPUT_PATH, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=["image_id", "prediction", "confidence"])
@@ -208,7 +235,7 @@ def main():
 
     print("\n" + "=" * 60)
     print("  Submission ready for Kaggle upload")
-    print("  Columns: image_id, prediction (0=chihuahua, 1=muffin), confidence")
+    print("  Columns: image_id | prediction (0=chihuahua, 1=muffin) | confidence")
     print("=" * 60)
     return 0
 

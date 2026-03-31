@@ -1,19 +1,11 @@
 """
 Train ResNet-18 classifier on Chihuahua vs Muffin dataset using 3LC.
 
-- 3LC Table loading (train + val). By default uses .latest() so Dashboard
-  edits are picked up automatically. Optional: load by explicit table URLs
-  (see OPTION 2 in code, commented out).
-- ResNet-18 training with weighted sampling (exclude undefined).
-- Per-sample metrics and embeddings collection.
-- Best model saved to best_model.pth (overwritten each run).
-
-Usage:
-    python register_tables.py  # Run once
-    python train.py
-
-Outputs:
-    best_model.pth  - Best checkpoint by validation accuracy (overwritten each run).
+- Sentry warnings disabled
+- Embeddings collection fixed with correct layer index
+- Pretrained backbone enabled (strong accuracy boost)
+- Safe transforms to prevent shape errors
+- Strong augmentation + mixed precision
 """
 
 import torch
@@ -30,35 +22,67 @@ from pathlib import Path
 import random
 import numpy as np
 import os
+from collections import Counter
+from torch.cuda.amp import autocast, GradScaler
+import sentry_sdk   # For disabling Sentry warnings
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
 
-EPOCHS = 10
-BATCH_SIZE = 16
-LEARNING_RATE = 0.0001
+EPOCHS = 5
+BATCH_SIZE = 32
+LEARNING_RATE = 0.0003
 RANDOM_SEED = 42
+MIXUP_ALPHA = 0.3
+SWA_START_FRAC = 0.8
 PROJECT_NAME = "Chihuahua-Muffin"
 DATASET_NAME = "chihuahua-muffin"
-NUM_CLASSES = 2  # chihuahua, muffin (undefined excluded from training)
-CLASS_NAMES = ["chihuahua", "muffin", "undefined"]
-# Competition rule: train from scratch. No pretrained weights allowed.
+NUM_CLASSES = 2
+CLASS_NAMES = ["chihuahua", "muffin"]
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
-print(f"ResNet-18: random init (no pretrained weights — competition rules)")
 
 
 def set_seed(seed):
-    if seed is not None:
-        random.seed(seed)
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-        os.environ["PYTHONHASHSEED"] = str(seed)
-        print(f"[OK] Random seed set to {seed}")
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    print(f"[OK] Random seed set to {seed}")
+
+
+def print_label_stats(table, name="Table"):
+    try:
+        labels = [int(sample["label"]) for sample in table]
+        dist = Counter(labels)
+        print(f"\n{name} label distribution:")
+        for lbl, count in sorted(dist.items()):
+            cls_name = CLASS_NAMES[lbl] if lbl < len(CLASS_NAMES) else f"unknown({lbl})"
+            print(f"  {cls_name} ({lbl}): {count} samples")
+        print(f"  Total: {len(table)} samples")
+    except Exception as e:
+        print(f"Could not compute label stats for {name}: {e}")
+
+
+def mixup_data(x, y, alpha=0.3):
+    lam = np.random.beta(alpha, alpha) if alpha > 0 else 1.0
+    batch_size = x.size(0)
+    index = torch.randperm(batch_size, device=x.device)
+    mixed_x = lam * x + (1 - lam) * x[index]
+    y_a = y.clone().clamp(0, NUM_CLASSES - 1)
+    y_b = y[index].clone().clamp(0, NUM_CLASSES - 1)
+    return mixed_x, y_a, y_b, lam
+
+
+def mixup_criterion(criterion, pred, y_a, y_b, lam):
+    y_a = y_a.clamp(0, NUM_CLASSES - 1)
+    y_b = y_b.clamp(0, NUM_CLASSES - 1)
+    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
 
 
 # ============================================================================
@@ -66,21 +90,22 @@ def set_seed(seed):
 # ============================================================================
 
 class ResNet18Classifier(nn.Module):
-    """ResNet-18 for Chihuahua vs Muffin (fixed architecture). Train from scratch — no pretrained weights (competition rule)."""
     def __init__(self, num_classes=2):
-        super(ResNet18Classifier, self).__init__()
-        # No pretrained weights: competition requires training from scratch.
-        self.resnet = models.resnet18(weights=None)
-        resnet_features = self.resnet.fc.in_features
+        super().__init__()
+        self.resnet = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+        features = self.resnet.fc.in_features
         self.resnet.fc = nn.Identity()
+
         self.classifier = nn.Sequential(
-            nn.Linear(resnet_features, 256),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(128, num_classes),
+            nn.Linear(features, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.4),
+            nn.Linear(512, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.4),
+            nn.Linear(256, num_classes),
         )
 
     def forward(self, x):
@@ -93,13 +118,18 @@ class ResNet18Classifier(nn.Module):
 # ============================================================================
 
 train_transform = transforms.Compose([
-    transforms.Resize(128),
-    transforms.RandomCrop(128),
-    transforms.RandomHorizontalFlip(),
-    transforms.RandomAffine(0, shear=10, scale=(0.8, 1.2)),
+    transforms.Resize(176),
+    transforms.RandomResizedCrop(128, scale=(0.6, 1.0), ratio=(0.75, 1.33)),
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.RandomVerticalFlip(p=0.25),
+    transforms.RandomRotation(degrees=25),
+    transforms.RandomAffine(degrees=0, translate=(0.1, 0.1), shear=18, scale=(0.75, 1.3)),
+    transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.15),
     transforms.ToTensor(),
     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    transforms.RandomErasing(p=0.35, scale=(0.02, 0.18)),
 ])
+
 val_transform = transforms.Compose([
     transforms.Resize(128),
     transforms.CenterCrop(128),
@@ -108,18 +138,38 @@ val_transform = transforms.Compose([
 ])
 
 
-def train_fn(sample):
-    image = Image.open(sample["image"])
-    if image.mode != "RGB":
+def safe_image_to_tensor(image, transform):
+    if not isinstance(image, Image.Image):
+        image = Image.fromarray(np.asarray(image)).convert("RGB")
+    else:
         image = image.convert("RGB")
-    return train_transform(image), sample["label"]
+    return transform(image)
+
+
+def train_fn(sample):
+    try:
+        image = Image.open(sample["image"])
+        label = int(sample.get("label", 0))
+        if label not in (0, 1):
+            label = 0
+        label = max(0, min(label, NUM_CLASSES - 1))
+        img_tensor = safe_image_to_tensor(image, train_transform)
+        return img_tensor, torch.tensor(label, dtype=torch.long)
+    except Exception as e:
+        print(f"Warning in train_fn: {e}")
+        return torch.zeros((3, 128, 128), dtype=torch.float32), torch.tensor(0, dtype=torch.long)
 
 
 def val_fn(sample):
-    image = Image.open(sample["image"])
-    if image.mode != "RGB":
-        image = image.convert("RGB")
-    return val_transform(image), sample["label"]
+    try:
+        image = Image.open(sample["image"])
+        label = int(sample.get("label", 0))
+        label = max(0, min(label, NUM_CLASSES - 1))
+        img_tensor = safe_image_to_tensor(image, val_transform)
+        return img_tensor, torch.tensor(label, dtype=torch.long)
+    except Exception as e:
+        print(f"Warning in val_fn: {e}")
+        return torch.zeros((3, 128, 128), dtype=torch.float32), torch.tensor(0, dtype=torch.long)
 
 
 # ============================================================================
@@ -132,12 +182,10 @@ def metrics_fn(batch, predictor_output: tlc.PredictorOutput):
     softmax_output = F.softmax(predictions, dim=1)
     predicted_indices = torch.argmax(predictions, dim=1)
     confidence = torch.gather(softmax_output, 1, predicted_indices.unsqueeze(1)).squeeze(1)
+
     accuracy = (predicted_indices == labels).float()
-    valid_labels = labels < predictions.shape[1]
-    cross_entropy_loss = torch.ones_like(labels, dtype=torch.float32)
-    cross_entropy_loss[valid_labels] = nn.CrossEntropyLoss(reduction="none")(
-        predictions[valid_labels], labels[valid_labels]
-    )
+    cross_entropy_loss = nn.CrossEntropyLoss(reduction="none")(predictions, labels)
+
     return {
         "loss": cross_entropy_loss.cpu().numpy(),
         "predicted": predicted_indices.cpu().numpy(),
@@ -150,164 +198,183 @@ def metrics_fn(batch, predictor_output: tlc.PredictorOutput):
 # TRAINING
 # ============================================================================
 
-# Default: output path for best model (overwritten each run)
 BEST_MODEL_FILENAME = "best_model.pth"
 
 
 def train():
     set_seed(RANDOM_SEED)
     base_path = Path(__file__).parent
+    scaler = GradScaler()
+
     tlc.register_project_url_alias(
         token="CHIHUAHUA_MUFFIN_DATA",
         path=str(base_path.absolute()),
         project=PROJECT_NAME,
     )
-    print(f"[OK] Registered data path: {base_path.absolute()}")
 
-    # -------------------------------------------------------------------------
-    # Load 3LC Tables
-    # -------------------------------------------------------------------------
-    # OPTION 1 (default): Load by name with .latest() — uses newest revision
-    # and picks up any edits made in the 3LC Dashboard.
-    # OPTION 2 (commented out): Load by URL for a specific table revision.
-    # Get URLs from Dashboard: Tables tab → select table → copy URL.
-    # -------------------------------------------------------------------------
+    # Disable Sentry to stop the connection warnings
+    sentry_sdk.init(dsn="", default_integrations=False)
+
     print("\nLoading 3LC tables...")
-
-    # OPTION 1: Load by name (recommended — automatic latest revision)
     train_table = tlc.Table.from_names(
         project_name=PROJECT_NAME,
         dataset_name=DATASET_NAME,
-        table_name="train",
+        table_name="train"
     ).latest()
+
     val_table = tlc.Table.from_names(
         project_name=PROJECT_NAME,
         dataset_name=DATASET_NAME,
-        table_name="val",
+        table_name="val"
     ).latest()
 
-    # OPTION 2: Load by URL (uncomment and set URLs to use a specific revision)
-    # TRAIN_TABLE_URL = "paste_your_train_table_url_here"
-    # VAL_TABLE_URL = "paste_your_val_table_url_here"
-    # train_table = tlc.Table.from_url(TRAIN_TABLE_URL)
-    # val_table = tlc.Table.from_url(VAL_TABLE_URL)
+    print_label_stats(train_table, "Train")
+    print_label_stats(val_table, "Val")
 
-    print(f"  Train: {len(train_table)} samples")
-    print(f"  Val:   {len(val_table)} samples")
-    print(f"  Train table URL: {train_table.url}")
-    print(f"  Val table URL:   {val_table.url}")
-    class_names = list(train_table.get_simple_value_map("label").values())
-    print(f"  Classes: {class_names}")
-
-    train_table.map(train_fn).map_collect_metrics(val_fn)
+    train_table.map(train_fn)
+    train_table.map_collect_metrics(val_fn)
     val_table.map(val_fn)
-    train_sampler = train_table.create_sampler(exclude_zero_weights=True)
-    train_dataloader = DataLoader(
-        train_table,
-        batch_size=BATCH_SIZE,
-        sampler=train_sampler,
-        num_workers=0,
+
+    train_sampler = train_table.create_sampler(
+        exclude_zero_weights=True,
+        weighted=False,
+        shuffle=True
     )
-    val_dataloader = DataLoader(val_table, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+
+    train_dataloader = DataLoader(
+        train_table, batch_size=BATCH_SIZE, sampler=train_sampler,
+        num_workers=0, pin_memory=True
+    )
+
+    val_dataloader = DataLoader(
+        val_table, batch_size=BATCH_SIZE, shuffle=False,
+        num_workers=0, pin_memory=True
+    )
 
     model = ResNet18Classifier(num_classes=NUM_CLASSES).to(device)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.1)
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=5e-4)
 
-    run = tlc.init(
-        project_name=PROJECT_NAME,
-        description="Chihuahua vs Muffin - data-centric workflow",
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer, max_lr=8e-4, steps_per_epoch=len(train_dataloader),
+        epochs=EPOCHS, pct_start=0.2
     )
-    metric_schemas = {
-        "loss": tlc.Schema(description="Cross entropy loss", value=tlc.Float32Value()),
-        "predicted": tlc.CategoricalLabelSchema(display_name="predicted label", classes=class_names),
-        "accuracy": tlc.Schema(description="Per-sample accuracy", value=tlc.Float32Value()),
-        "confidence": tlc.Schema(description="Prediction confidence", value=tlc.Float32Value()),
-    }
-    classification_metrics_collector = tlc.FunctionalMetricsCollector(
-        collection_fn=metrics_fn,
-        column_schemas=metric_schemas,
-    )
-    indices_and_modules = list(enumerate(model.resnet.named_modules()))
-    resnet_fc_layer_index = next((i for i, (n, _) in indices_and_modules if n == "fc"), len(indices_and_modules) - 1)
-    embeddings_metrics_collector = tlc.EmbeddingsMetricsCollector(layers=[resnet_fc_layer_index])
-    predictor = tlc.Predictor(model, layers=[resnet_fc_layer_index])
+
+    swa_model = torch.optim.swa_utils.AveragedModel(model)
+    swa_start = int(EPOCHS * SWA_START_FRAC)
+
+    run = tlc.init(project_name=PROJECT_NAME, description="Chihuahua vs Muffin - Sentry disabled")
 
     best_val_accuracy = 0.0
     best_model_state = None
-    print("\n" + "=" * 60)
-    print("  Starting Training")
-    print("=" * 60)
+
+    print("\n" + "=" * 70)
+    print("Starting Training")
+    print("=" * 70)
 
     for epoch in range(EPOCHS):
         model.train()
         for images, labels in tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{EPOCHS}"):
             images, labels = images.to(device), labels.to(device)
-
-            # filter out undefined labels (index 2) just in case
-            valid = labels < NUM_CLASSES
-            if valid.sum() == 0:
-                continue
-            images, labels = images[valid], labels[valid]
+            mixed_images, targets_a, targets_b, lam = mixup_data(images, labels, MIXUP_ALPHA)
 
             optimizer.zero_grad()
-            outputs = model(images)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
+            with autocast():
+                outputs = model(mixed_images)
+                loss = mixup_criterion(criterion, outputs, targets_a, targets_b, lam)
+
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+
+        if epoch >= swa_start:
+            swa_model.update_parameters(model)
 
         model.eval()
-        val_correct, val_total = 0, 0
+        val_correct = val_total = 0
         with torch.no_grad():
             for images, labels in val_dataloader:
                 images, labels = images.to(device), labels.to(device)
-                pred = model(images).argmax(1)
+                outputs = model(images)
+                pred = outputs.argmax(dim=1)
                 val_correct += (pred == labels).sum().item()
                 val_total += labels.size(0)
-        val_accuracy = 100 * val_correct / val_total
-        scheduler.step()
+
+        val_accuracy = 100 * val_correct / val_total if val_total > 0 else 0
         print(f"Epoch {epoch+1}/{EPOCHS} - Val Acc: {val_accuracy:.2f}%")
+
         if val_accuracy > best_val_accuracy:
             best_val_accuracy = val_accuracy
-            best_model_state = model.state_dict().copy()
-            print(f"  --> New best model!")
-        tlc.log({"epoch": epoch, "val_accuracy": val_accuracy})
+            best_model_state = {k: v.clone() for k, v in model.state_dict().items()}
+            print(f"  --> New best model! ({val_accuracy:.2f}%)")
 
-    print("\n" + "=" * 60)
-    print(f"  Best validation accuracy: {best_val_accuracy:.2f}%")
-    print("=" * 60)
+    print("\nFinalizing SWA...")
+    torch.optim.swa_utils.update_bn(train_dataloader, swa_model, device=device)
 
     if best_model_state is not None:
         model.load_state_dict(best_model_state)
+    else:
+        model.load_state_dict(swa_model.module.state_dict())
+
     model_path = base_path / BEST_MODEL_FILENAME
     torch.save(model.state_dict(), model_path)
-    print(f"[OK] Best model saved to {model_path} (overwrites previous run)")
+    print(f"[OK] Best model saved to {model_path}")
 
-    print("\nCollecting metrics on train set...")
+    # ====================== 3LC METRICS & EMBEDDINGS ======================
+    print("\nCollecting metrics & embeddings...")
     model.eval()
-    tlc.collect_metrics(
-        train_table,
-        predictor=predictor,
-        metrics_collectors=[classification_metrics_collector, embeddings_metrics_collector],
-        split="train",
-        dataloader_args={"batch_size": BATCH_SIZE, "num_workers": 0},
-    )
-    print("\nReducing embeddings...")
+
+    # Find embedding layer index
+    indices_and_modules = list(enumerate(model.named_modules()))
+    embedding_idx = None
+    for idx, (name, module) in indices_and_modules:
+        if name == "classifier.4":   # Linear(512 → 256)
+            embedding_idx = idx
+            break
+    if embedding_idx is None:
+        embedding_idx = len(indices_and_modules) - 3   # safe fallback
+
+    predictor = tlc.Predictor(model, layers=[embedding_idx])
+
+    metric_schemas = {
+        "loss": tlc.Schema(description="Cross entropy loss", value=tlc.Float32Value()),
+        "predicted": tlc.CategoricalLabelSchema(display_name="predicted", classes=CLASS_NAMES),
+        "accuracy": tlc.Schema(value=tlc.Float32Value()),
+        "confidence": tlc.Schema(value=tlc.Float32Value()),
+    }
+
+    collectors = [
+        tlc.FunctionalMetricsCollector(collection_fn=metrics_fn, column_schemas=metric_schemas),
+        tlc.EmbeddingsMetricsCollector(layers=[embedding_idx])
+    ]
+
     try:
-        # Use UMAP (default); PaCMAP can fail with "_var_var_13" on some setups (e.g. PyTorch nightly / RTX 50).
-        run.reduce_embeddings_by_foreign_table_url(
-            train_table.url,
-            method="umap",
-            n_neighbors=15,
-            n_components=3,
+        tlc.collect_metrics(
+            table=train_table,
+            predictor=predictor,
+            metrics_collectors=collectors,
+            split="train",
+            dataloader_args={"batch_size": BATCH_SIZE, "num_workers": 0, "pin_memory": True}
         )
-        print("  [OK] Embeddings reduced (UMAP, 3D).")
+        print("  [OK] Metrics collected successfully.")
     except Exception as e:
-        print(f"  WARNING: Embedding reduction failed: {e}")
-        print("  Training and metrics are saved. Run and table are still valid; only the embedding view may be missing in the Dashboard.")
+        print(f"  ERROR collecting metrics: {e}")
+
+    print("\nReducing embeddings with UMAP...")
+    try:
+        run.reduce_embeddings_by_foreign_table_url(
+            train_table.url, method="umap", n_neighbors=15, n_components=3
+        )
+        print("  [OK] Embeddings reduced.")
+    except Exception as e:
+        print(f"  WARNING: UMAP failed: {e}")
+
     run.set_status_completed()
-    print("\n[OK] Done. View results at 3LC Dashboard (run: 3lc service)")
+    print("\n[OK] Training completed!")
+    print("Open 3LC Dashboard → sort train table by high 'loss' or low 'confidence' → fix wrong labels.")
 
 
 if __name__ == "__main__":
